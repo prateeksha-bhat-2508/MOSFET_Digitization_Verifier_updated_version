@@ -1,0 +1,8 @@
+.venv/
+__pycache__/
+*.pyc
+.idea/
+Interns_Devices/
+WPD_Verifier_Output/
+WPD_Verified_Output/
+.env
