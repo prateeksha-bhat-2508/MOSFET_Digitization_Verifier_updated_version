@@ -17,6 +17,7 @@ from wpd_inventory import (
     discover_devices, iter_device_files, safe_component, intern_report_filename,
     audit_files, family_availability, build_requirements,
     crosscheck_names, source_image_choice, family_comments,
+    read_csv_record, decade_density,
 )
 
 
@@ -104,6 +105,18 @@ def verify_device(intern, device, device_dir, root, output_root, snapshot=""):
         # record REVIEW and continue with the next available CSV.
         check = verify_csv(source, csv_path, destination, api, note, preview_mapping=None)
         check.csv_file = str(csv_path.relative_to(device_dir))
+        if family == "CC":
+            try:
+                record = read_csv_record(csv_path)
+                x_text, y_text = str(check.x_mapping), str(check.y_mapping)
+                x_log = True if x_text.startswith("log") else (False if x_text.startswith("linear") else None)
+                y_log = True if y_text.startswith("log") else (False if y_text.startswith("linear") else None)
+                density_status, density_note = decade_density(record["x"], record["y"], x_log, y_log)
+                if density_note:
+                    check.comments.append(density_note)
+                check.overall_status = api.aggregate([check.overall_status, density_status])
+            except Exception as error:
+                check.comments.append(f"Point-density check could not run: {type(error).__name__}: {error}")
         result.level2.append(check)
     result.file_completeness_status = api.aggregate([q.status for q in result.requirements if q.category in {"Required output", "Dataset filename correspondence", "CSV export consistency"}])
     for family in FAMILIES:

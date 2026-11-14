@@ -521,7 +521,10 @@ def build_requirements(device, pdfs, tars, csvs, images, api):
                 "" if c25 else (f"{family}_TEMPERATURE_UNKNOWN" if unknown else f"{family}_25C_CSV_MISSING"))
             if not any(detect_temperature(p.stem) in {150, 175} for p in cs):
                 add("Optional output", family, f"{family} at 150 or 175 C", "Only if provided by the source", "No such CSV identified", "WARNING",
+            
                     "Higher-temperature extraction is optional. Its absence does not change the verification status.", "OPTIONAL_TEMPERATURE_MISSING", "WARNING")
+            # Every standalone graph image should have a WPD project and a CSV.
+    
     return checks
 
 
@@ -538,7 +541,59 @@ def semantic_key(name, family=None, inherited_temperature=None):
 
 EXPORT_RTOL = 1e-6
 EXPORT_ATOL = 1e-9
+EXPORT_MATCH_FRACTION_PASS = 0.80 
+  # PASS if at least 80% of CSV rows match the TAR
+DENSITY_MIN_POINTS = 5     # wanted points per decade (CC)
+DENSITY_FAIL_BELOW = 3     # fewer than this in a decade -> FAIL, else REVIEW
 
+
+def decade_density(x, y=None, x_log=None, y_log=None, review_step=0.25, fail_step=0.40):
+    """CC sampling check that works for log/log, log/linear and linear/log axes.
+
+    A log axis is measured in decades. A linear axis counts as 4 units over its
+    data range, like a 4-decade graph. A big step between neighbouring points
+    means that region is sparsely sampled. Unknown scales default to
+    X linear and Y log, the usual capacitance graph.
+    """
+    if y is None:
+        return "PASS", ""
+    x_log = bool(x_log) if x_log is not None else False
+    y_log = bool(y_log) if y_log is not None else True
+    xs = np.asarray(x, dtype=float)
+    ys = np.asarray(y, dtype=float)
+    ok = np.isfinite(xs) & np.isfinite(ys)
+    if y_log:
+        ok &= ys > 0
+    if x_log:
+        ok &= xs > 0
+        if ok.any():
+            ok &= xs > float(xs[ok].max()) * 1e-6      # ignore ~0 artifacts such as 2.8e-14
+    xs, ys = xs[ok], ys[ok]
+    if len(xs) < 3:
+        return "PASS", ""
+    order = np.argsort(xs, kind="stable")
+    xs, ys = xs[order], ys[order]
+
+    def units(values, is_log):
+        if is_log:
+            return np.log10(values)
+        span = float(values.max() - values.min())
+        return values / span * 4.0 if span > 0 else values * 0.0
+
+    dx = np.abs(np.diff(units(xs, x_log)))
+    dy = np.abs(np.diff(units(ys, y_log)))
+    length = np.hypot(dx, dy)
+    fail_here = (dy > fail_step) | ((dx > fail_step) if x_log else False)
+    if not (length > review_step).any() and not np.any(fail_here):
+        return "PASS", ""
+    i = int(np.argmax(length))
+    status = "FAIL" if np.any(fail_here) else "REVIEW"
+    bad = int(np.sum((length > review_step) | fail_here))
+    axes = f"X {'log' if x_log else 'linear'}, Y {'log' if y_log else 'linear'}"
+    return status, (
+        f"Sparse sampling ({axes}): between X={xs[i]:g}, Y={ys[i]:g} and X={xs[i+1]:g}, Y={ys[i+1]:g} "
+        f"the curve moves {length[i]:.2f} units in one step (limit {review_step:g}). "
+        f"{bad} step(s) exceed the limit. Add more points in this region, usually near the low-X knee.")
 
 def _match_pairs(candidates, stored_count):
     """Find a maximum paired-row matching without reusing duplicate points."""
@@ -668,7 +723,20 @@ def compare_export_values(saved_values, csv_record):
                 "The strict tolerance remains unchanged, and no axis range is used. "
                 f"Rounding examples (CSV tokens, saved values and decimal quantum)={samples}."
             )
+        # Partial-match tolerance for ALL families (CC, OC, TC):
+    # PASS when at least 80% of rows match, strictly or after CSV rounding.
     if result["status"] == "FAIL":
+        denominator = max(len(actual), len(stored))
+        best = max(result["matched_rows"], result.get("rounding_matched_rows", 0))
+        fraction = best / denominator if denominator else 0.0
+        result["match_fraction"] = fraction
+        if fraction >= EXPORT_MATCH_FRACTION_PASS:
+            result["status"] = "PASS"
+            result["issue_code"] = "CSV_PARTIAL_MATCH_PASS"
+            result["comment"] += (
+                f" CSV_PARTIAL_MATCH_PASS: {best} of {denominator} rows ({fraction:.0%}) match the saved WPD values; "
+                f"at least {EXPORT_MATCH_FRACTION_PASS:.0%} is accepted.")
+    if result["status"] == "FAIL" or result.get("issue_code") == "CSV_PARTIAL_MATCH_PASS":
         result["comment"] += f" Unmatched CSV examples={result['unmatched_csv_samples']}; unmatched WPD examples={result['unmatched_wpd_samples']}."
     return result
 

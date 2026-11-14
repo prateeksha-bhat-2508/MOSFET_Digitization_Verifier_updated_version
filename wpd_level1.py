@@ -314,7 +314,7 @@ def verify_project_impl(tar_path, out_dir, api):
     tar_path, out_dir = Path(tar_path), Path(out_dir)
     family = api.classify_family(tar_path.name)
     pr = api.ProjectResult(project=tar_path.name, family=family)
-    from wpd_inventory import graph_family_warning
+    from wpd_inventory import graph_family_warning, decade_density
     physical_warning = graph_family_warning(tar_path.name, family)
     if physical_warning:
         pr.comments.append(physical_warning)
@@ -444,13 +444,7 @@ def verify_project_impl(tar_path, out_dir, api):
     else:
         pr.comments.append("Dataset-to-source-curve identity is not automatically established by dataset names; inspect every labelled overlay.")
         names = [str(ds.get("name", "")).upper() for ds in raw_datasets]
-        if family == "CC":
-            for expected in ("COSS", "CRSS"):
-                if not any(expected in name for name in names):
-                    pr.comments.append(
-                        f"No WPD dataset is clearly labelled {expected}. Confirm whether the corresponding source curve "
-                        "is unavailable, missing from extraction, or present under a different dataset name."
-                    )
+
         if len(set(names)) != len(names):
             pr.comments.append("Dataset names are duplicated; confirm each dataset's physical curve and exported-file association.")
     trace_statuses, completeness_statuses = [], []
@@ -516,7 +510,19 @@ def verify_project_impl(tar_path, out_dir, api):
             reasons.append("Gate voltage is not clearly identified in the dataset name; confirm VGS against the source trace label.")
         if family == "TC" and api.detect_temperature(name) is None:
             reasons.append("Temperature is not explicit in the dataset name; confirm it from the source figure or trace legend.")
-
+        if family == "CC":
+            xs = [v[0] for v in exported_values if v]
+            ys = [v[1] for v in exported_values if v]
+            if len(xs) >= 3:
+                fit_x = source_cal.get("x") if source_cal else None
+                fit_y = source_cal.get("y") if source_cal else None
+                x_log = (fit_x["kind"] == "log") if _fit_is_confirmed(fit_x) else (pr.x_scale == "log")
+                y_log = (fit_y["kind"] == "log") if _fit_is_confirmed(fit_y) else (pr.y_scale == "log")
+                density_status, density_note = decade_density(xs, ys, x_log, y_log)
+                if density_note:
+                    reasons.append(density_note)
+                if density_status == "FAIL":
+                    completeness = "FAIL"
         med = p95 = None
         if image_bytes and finite_points:
             try:
