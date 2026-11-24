@@ -547,13 +547,23 @@ DENSITY_MIN_POINTS = 5     # wanted points per decade (CC)
 DENSITY_FAIL_BELOW = 3     # fewer than this in a decade -> FAIL, else REVIEW
 
 
-def decade_density(x, y=None, x_log=None, y_log=None, review_step=0.25, fail_step=0.40):
+def decade_density(x, y=None, x_log=None, y_log=None, review_step=0.35, fail_step=0.40,
+                   x_range=None, x_gap_fail_fraction=0.25):
     """CC sampling check that works for log/log, log/linear and linear/log axes.
 
-    A log axis is measured in decades. A linear axis counts as 4 units over its
-    data range, like a 4-decade graph. A big step between neighbouring points
-    means that region is sparsely sampled. Unknown scales default to
-    X linear and Y log, the usual capacitance graph.
+    Gaps are measured along the curve, not along sorted X. A steep knee is
+    almost vertical and its X values wobble by a pixel or two, so sorting by X
+    scrambles the points and shows a false big jump. Instead the points are
+    joined into a minimum spanning path (nearest-neighbour chain) and the
+    longest link is the largest real gap.
+
+    A log axis is measured in decades. A linear axis counts as 4 units over the
+    calibrated X range (x_range=(X1, X2) from the WPD calibration, falling back
+    to the data span). The calibrated X2 is NOT extended to the plot frame.
+      * Y gap  : a link longer than fail_step decades on Y   -> FAIL
+      * X gap  : a link wider than x_gap_fail_fraction of the X range -> FAIL
+      * Any link longer than review_step                    -> REVIEW
+    Unknown scales default to X linear and Y log.
     """
     if y is None:
         return "PASS", ""
@@ -571,29 +581,61 @@ def decade_density(x, y=None, x_log=None, y_log=None, review_step=0.25, fail_ste
     xs, ys = xs[ok], ys[ok]
     if len(xs) < 3:
         return "PASS", ""
-    order = np.argsort(xs, kind="stable")
-    xs, ys = xs[order], ys[order]
 
-    def units(values, is_log):
-        if is_log:
-            return np.log10(values)
-        span = float(values.max() - values.min())
-        return values / span * 4.0 if span > 0 else values * 0.0
+    if x_log:
+        ux = np.log10(xs)
+        span_x = 1.0
+        lo, hi = float(xs.min()), float(xs.max())
+    else:
+        lo, hi = (float(x_range[0]), float(x_range[1])) if x_range is not None else (float(xs.min()), float(xs.max()))
+        if hi < lo:
+            lo, hi = hi, lo
+        span_x = hi - lo
+        if span_x <= 0:
+            span_x = float(xs.max() - xs.min()) or 1.0
+        ux = xs / span_x * 4.0
+    uy = np.log10(ys) if y_log else ys / ((float(ys.max() - ys.min()) or 1.0)) * 4.0
 
-    dx = np.abs(np.diff(units(xs, x_log)))
-    dy = np.abs(np.diff(units(ys, y_log)))
+    # Prim's minimum spanning tree (n is small); record each link's dx, dy.
+    n = len(xs)
+    pts = np.column_stack((ux, uy))
+    in_tree = np.zeros(n, bool)
+    in_tree[0] = True
+    dist = np.hypot(*(pts - pts[0]).T)
+    parent = np.zeros(n, int)
+    links = []
+    for _ in range(n - 1):
+        d = np.where(in_tree, np.inf, dist)
+        j = int(np.argmin(d))
+        links.append((parent[j], j))
+        in_tree[j] = True
+        nd = np.hypot(*(pts - pts[j]).T)
+        better = (nd < dist) & ~in_tree
+        dist[better], parent[better] = nd[better], j
+    ia = np.array([p for p, _ in links])
+    ib = np.array([q for _, q in links])
+    dx = np.abs(ux[ia] - ux[ib])
+    dy = np.abs(uy[ia] - uy[ib])
     length = np.hypot(dx, dy)
-    fail_here = (dy > fail_step) | ((dx > fail_step) if x_log else False)
-    if not (length > review_step).any() and not np.any(fail_here):
+
+    x_gap_limit = fail_step if x_log else x_gap_fail_fraction * 4.0   # in axis units
+    y_fail = dy > fail_step
+    x_fail = dx > x_gap_limit
+    over = length > review_step
+    if not (over.any() or y_fail.any() or x_fail.any()):
         return "PASS", ""
-    i = int(np.argmax(length))
-    status = "FAIL" if np.any(fail_here) else "REVIEW"
-    bad = int(np.sum((length > review_step) | fail_here))
     axes = f"X {'log' if x_log else 'linear'}, Y {'log' if y_log else 'linear'}"
+    status = "FAIL" if (y_fail.any() or x_fail.any()) else "REVIEW"
+    bad = int(np.sum(over | y_fail | x_fail))
+    i = int(np.argmax(np.where(y_fail | x_fail, length, -1))) if status == "FAIL" else int(np.argmax(length))
+    p, q = (ia[i], ib[i]) if xs[ia[i]] <= xs[ib[i]] else (ib[i], ia[i])
+    kind = "Y gap" if y_fail[i] or (not x_fail[i]) else "X gap"
+    where = f"X range {lo:g} to {hi:g}; " if not x_log else ""
     return status, (
-        f"Sparse sampling ({axes}): between X={xs[i]:g}, Y={ys[i]:g} and X={xs[i+1]:g}, Y={ys[i+1]:g} "
-        f"the curve moves {length[i]:.2f} units in one step (limit {review_step:g}). "
-        f"{bad} step(s) exceed the limit. Add more points in this region, usually near the low-X knee.")
+        f"Sparse sampling ({axes}; {where}{kind}): between X={xs[p]:g}, Y={ys[p]:g} and X={xs[q]:g}, Y={ys[q]:g} "
+        f"the nearest consecutive curve points are {length[i]:.2f} units apart (review limit {review_step:g}, fail limit {fail_step:g}). "
+        f"{bad} link(s) exceed the limit. Add more points in this region, usually near the low-X knee.")
+
 
 def _match_pairs(candidates, stored_count):
     """Find a maximum paired-row matching without reusing duplicate points."""

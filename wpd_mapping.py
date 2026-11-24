@@ -196,17 +196,42 @@ def _ocr_strip(image, box, axis, scale=5):
                     except (ValueError,KeyError):
                         continue
                     center=bx+bw/2 if axis=='X' else by+bh/2
+                    # Ignore tiny OCR fragments. They are common where grid
+                    # intersections or antialiasing resemble isolated digits.
+                    if bw < 4.0 or bh < 7.0:
+                        continue
+                    # The Y-axis OCR strip also contains the vertically printed
+                    # axis title. Its glyph fragments were being read as numeric
+                    # values (for example O/Oo -> 0), poisoning the log fit.
+                    # Tick numerals sit against the plot edge; the rotated title
+                    # sits in the left half of this external strip. Retain only
+                    # text whose horizontal centre is in the right half.
+                    if axis == 'Y':
+                        x_start, _, x_end, _ = box
+                        if bx + bw/2 < x_start + .50*(x_end-x_start):
+                            continue
                     found.append({'label_center':center,'value':value,'raw_text':raw,
                                   'bbox':(bx,by,bw,bh),'confidence':confidence,'psm':psm})
             except (OSError,subprocess.SubprocessError) as exc:
                 errors.append(type(exc).__name__+': '+str(exc))
+    # PSM 6 and PSM 11 sometimes return different text for the exact same
+    # printed label and bounding box (e.g. 100 versus 4100). Treat highly
+    # overlapping boxes at the same axis position as one OCR observation and
+    # retain the higher-confidence reading rather than declaring a conflict.
     deduped=[]
     for item in sorted(found,key=lambda x:-x['confidence']):
-        if not any(abs(item['label_center']-q['label_center'])<=3
-                   and ((item['value'] is None and q['value'] is None and item['raw_text']==q['raw_text'])
-                        or (item['value'] is not None and q['value'] is not None
-                            and math.isclose(item['value'],q['value'],rel_tol=1e-9,abs_tol=1e-12)))
-                   for q in deduped):
+        bx,by,bw,bh=item['bbox']
+        area=max(1e-9,bw*bh)
+        duplicate=False
+        for q in deduped:
+            qx,qy,qw,qh=q['bbox']
+            ix=max(0.0,min(bx+bw,qx+qw)-max(bx,qx))
+            iy=max(0.0,min(by+bh,qy+qh)-max(by,qy))
+            overlap=(ix*iy)/max(1e-9,min(area,qw*qh))
+            if (abs(item['label_center']-q['label_center'])<=3.0 and overlap>=.65):
+                duplicate=True
+                break
+        if not duplicate:
             deduped.append(item)
     return sorted(deduped,key=lambda x:x['label_center']), errors
 
@@ -348,8 +373,25 @@ def _fit_candidates(labels, span):
             _,a,b,keep,residual,indices=best
             chosen=indices[keep]
             values=[(float(pixel[i]),float(value[i])) for i in chosen]
+            # Preserve a separately validated first/last labelled tick even
+            # when raster fitting excludes it by a few pixels. These candidates
+            # do NOT participate in the scale fit: they are accepted only when
+            # they are an outermost OCR-anchored tick and their value projects
+            # within a bounded 3%-of-axis-span allowance of the independently fitted mapping.
+            endpoint_points=[]
+            for endpoint_index in (int(np.argmin(pixel)), int(np.argmax(pixel))):
+                endpoint_pixel=float(pixel[endpoint_index])
+                endpoint_value=float(value[endpoint_index])
+                if any(abs(endpoint_pixel-p)<1.0 and math.isclose(endpoint_value,v,rel_tol=1e-8,abs_tol=1e-10) for p,v in values):
+                    continue
+                transformed_value=math.log10(endpoint_value) if kind=='log' and endpoint_value>0 else endpoint_value
+                if kind=='log' and endpoint_value<=0:
+                    continue
+                projected_pixel=(transformed_value-b)/a if abs(a)>1e-15 else None
+                if projected_pixel is not None and abs(projected_pixel-endpoint_pixel)<=max(12.0,.03*span,tolerance):
+                    endpoint_points.append((endpoint_pixel,endpoint_value))
             fits.append({'kind':kind,'coef':[float(a),float(b)],'a':float(a),'b':float(b),
-                         'n':len(values),'points':values,'rejected':len(labels)-len(values),
+                         'n':len(values),'points':values,'endpoint_points':endpoint_points,'rejected':len(labels)-len(values),
                          'observed_pixel_range':[min(p for p,v in values),max(p for p,v in values)],
                          'observed_value_range':[min(v for p,v in values),max(v for p,v in values)],
                          'pixel_error':float(np.max(residual[keep])),

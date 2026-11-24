@@ -518,7 +518,11 @@ def verify_project_impl(tar_path, out_dir, api):
                 fit_y = source_cal.get("y") if source_cal else None
                 x_log = (fit_x["kind"] == "log") if _fit_is_confirmed(fit_x) else (pr.x_scale == "log")
                 y_log = (fit_y["kind"] == "log") if _fit_is_confirmed(fit_y) else (pr.y_scale == "log")
-                density_status, density_note = decade_density(xs, ys, x_log, y_log)
+                # The calibrated X1..X2 is the valid X range; it is not extended
+                # to the physical end of the plot frame.
+                cal_x = {getattr(cp, "role", ""): _number(getattr(cp, "dx", None)) for cp in (pr.calibration or [])}
+                x_range = (cal_x["X1"], cal_x["X2"]) if cal_x.get("X1") is not None and cal_x.get("X2") is not None else None
+                density_status, density_note = decade_density(xs, ys, x_log, y_log, x_range=x_range)
                 if density_note:
                     reasons.append(density_note)
                 if density_status == "FAIL":
